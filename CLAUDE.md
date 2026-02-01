@@ -32,6 +32,7 @@ Three layer groups managed independently:
 
 ### Coordinate System & Distance
 - **Hub**: Fixed at San Francisco (37.7749, -122.4194)
+- **Max Range**: 8km hard constraint (Zipline operational limit)
 - **Distance**: Equirectangular approximation for small distances
   ```javascript
   distanceKm(lat1, lon1, lat2, lon2) {
@@ -41,16 +42,20 @@ Three layer groups managed independently:
     return Math.sqrt(x*x + y*y) * R;
   }
   ```
+- **Range Enforcement**: Orders beyond 8km are rejected and skipped
 
 ### Order Generation: Uniform-in-Disk Sampling
 Generate orders with uniform spatial density within delivery radius:
 ```javascript
 // Sample radius: r = R * sqrt(u) to get uniform area distribution
 // Sample angle: theta = 2π * u
-// Use R = 1.5 * avgRadiusKm so E[r] ≈ avgRadiusKm
-const r = 1.5 * avgRadiusKm * Math.sqrt(Math.random());
+// Use R = 1.5 * effectiveRadius so E[r] ≈ effectiveRadius
+// effectiveRadius = min(avgRadiusKm, MAX_RANGE_KM) enforces 8km limit
+const effectiveRadius = Math.min(avgRadiusKm, MAX_RANGE_KM);
+const r = 1.5 * effectiveRadius * Math.sqrt(Math.random());
 const theta = 2 * Math.PI * Math.random();
 // Convert to lat/lng offset (small-distance approximation)
+// Orders exceeding MAX_RANGE_KM are rejected and skipped
 ```
 
 ### Order Arrival: Deterministic Per-Second Accumulator

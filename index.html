@@ -619,6 +619,7 @@
 
         const HUB_LAT = 37.7749;
         const HUB_LNG = -122.4194;
+        const MAX_RANGE_KM = 8;  // Maximum delivery range for Zipline drones
 
         // Aliases for consistency (used throughout simulation code)
         const hubLat = HUB_LAT;
@@ -1153,7 +1154,9 @@ out geom;
             orderAccumulator: 0,        // Fractional order accumulator for deterministic generation
             nextOrderTime: 0,           // Next order arrival time for Poisson process
             nextOrderId: 0,             // Counter for order IDs
-            nextDroneId: 0              // Counter for drone IDs
+            nextDroneId: 0,             // Counter for drone IDs
+            ordersCreated: 0,           // Total orders successfully created (excludes skipped orders)
+            ordersSkipped: 0            // Total orders skipped (beyond max range)
         };
 
         /**
@@ -1322,6 +1325,7 @@ out geom;
          * Filter buildings to only those within delivery radius
          * Call this when buildings are loaded or radius changes
          * This dramatically improves performance at high order rates
+         * Enforces MAX_RANGE_KM constraint for Zipline drones
          */
         function filterBuildingsByRadius(radiusKm) {
             if (buildingLocations.length === 0) {
@@ -1330,13 +1334,16 @@ out geom;
                 return;
             }
 
-            console.log(`Filtering ${buildingLocations.length} buildings for ${radiusKm}km radius...`);
+            // Enforce maximum range constraint
+            const effectiveRadius = Math.min(radiusKm, MAX_RANGE_KM);
+
+            console.log(`Filtering ${buildingLocations.length} buildings for ${effectiveRadius}km radius (max: ${MAX_RANGE_KM}km)...`);
             filteredBuildingLocations = buildingLocations.filter(([lat, lng]) => {
                 const dist = distanceKm(hubLat, hubLng, lat, lng);
-                return dist <= radiusKm;
+                return dist <= effectiveRadius;
             });
-            lastFilteredRadius = radiusKm;
-            console.log(`✓ ${filteredBuildingLocations.length} buildings within ${radiusKm}km radius`);
+            lastFilteredRadius = effectiveRadius;
+            console.log(`✓ ${filteredBuildingLocations.length} buildings within ${effectiveRadius}km radius`);
         }
 
         /**
@@ -1350,9 +1357,12 @@ out geom;
          * @returns {object} Object with {lat, lng} in degrees
          */
         function sampleOrder(hubLat, hubLng, avgRadiusKm) {
+            // Enforce maximum range constraint
+            const effectiveRadius = Math.min(avgRadiusKm, MAX_RANGE_KM);
+
             // Re-filter if radius changed (handles dynamic slider changes)
-            if (Math.abs(avgRadiusKm - lastFilteredRadius) > 0.01) {
-                filterBuildingsByRadius(avgRadiusKm);
+            if (Math.abs(effectiveRadius - lastFilteredRadius) > 0.01) {
+                filterBuildingsByRadius(effectiveRadius);
             }
 
             // If we have filtered building locations, sample from them
@@ -1364,13 +1374,14 @@ out geom;
 
             // If no filtered buildings available, warn user
             if (buildingLocations.length > 0 && filteredBuildingLocations.length === 0) {
-                console.warn(`No buildings within ${avgRadiusKm}km radius. Total buildings: ${buildingLocations.length}. Consider increasing Buildings Radius or Delivery Radius.`);
+                console.warn(`No buildings within ${effectiveRadius}km radius (max range: ${MAX_RANGE_KM}km). Total buildings: ${buildingLocations.length}. Consider increasing Buildings Radius.`);
             }
 
             // Fallback: uniform-in-disk distribution (if buildings not loaded)
             // Sample radius: r = R * sqrt(u) gives uniform area distribution
-            // Use R = 1.5 * avgRadiusKm so E[r] ≈ avgRadiusKm
-            const r = 1.5 * avgRadiusKm * Math.sqrt(Math.random());
+            // Use R = 1.5 * effectiveRadius so E[r] ≈ effectiveRadius
+            // Enforce max range constraint
+            const r = 1.5 * effectiveRadius * Math.sqrt(Math.random());
 
             // Sample angle uniformly
             const theta = 2 * Math.PI * Math.random();
@@ -1849,6 +1860,8 @@ out geom;
             sim.nextOrderTime = 0;
             sim.nextOrderId = 0;
             sim.nextDroneId = 0;
+            sim.ordersCreated = 0;
+            sim.ordersSkipped = 0;
 
             // Clear data structures
             orders = [];
@@ -2023,9 +2036,23 @@ out geom;
             const effectiveSpeed = sim.realT > 0 ? sim.simT / sim.realT : 1.0;
 
             // Calculate actual order generation rate (orders per hour in sim time)
-            const totalOrders = orders.length;
+            // Use sim.ordersCreated for accurate count (excludes skipped orders)
+            const totalOrders = sim.ordersCreated;
             const simHours = sim.simT / 3600;
+
+            // For Poisson: rate will vary, but should average to target over time
+            // For Deterministic: rate should exactly match target
+            // Expected cumulative orders at this time: params.ordersPerHour × simHours
+            const expectedOrders = params.ordersPerHour * simHours;
             const actualOrderRate = simHours > 0 ? totalOrders / simHours : 0;
+
+            // Log any significant deviation (for debugging)
+            if (simHours > 0.1 && Math.abs(actualOrderRate - params.ordersPerHour) / params.ordersPerHour > 0.2) {
+                // Only log if > 20% deviation after 6+ minutes of sim time
+                if (Math.floor(sim.simT / 60) !== Math.floor((sim.simT - dtReal * params.timeScale) / 60)) {
+                    console.log(`⚠️ Rate deviation: Expected ${params.ordersPerHour}/hr, Actual ${actualOrderRate.toFixed(1)}/hr | Orders: ${totalOrders}/${expectedOrders.toFixed(1)} | Skipped: ${sim.ordersSkipped}`);
+                }
+            }
 
             // Update DOM elements
             document.getElementById('avg-delivery-stat').textContent = formatDuration(avgDeliverySec);
@@ -2033,8 +2060,13 @@ out geom;
             document.getElementById('completed-stat').textContent = numCompleted;
             document.getElementById('queue-stat').textContent = queueSize;
             document.getElementById('active-drones-stat').textContent = activeDrones;
-            document.getElementById('total-orders-stat').textContent = totalOrders;
-            document.getElementById('actual-rate-stat').textContent = actualOrderRate > 0 ? `${Math.round(actualOrderRate)}/hr` : '--';
+            document.getElementById('total-orders-stat').textContent = `${totalOrders}${sim.ordersSkipped > 0 ? ` (${sim.ordersSkipped} skipped)` : ''}`;
+
+            // Show actual rate with target for comparison
+            const rateText = actualOrderRate > 0 ? `${Math.round(actualOrderRate)}/hr` : '--';
+            const targetRate = params.ordersPerHour;
+            const rateColor = simHours > 0.1 && Math.abs(actualOrderRate - targetRate) / targetRate > 0.15 ? ' style="color: #ffa500;"' : '';
+            document.getElementById('actual-rate-stat').innerHTML = `<span${rateColor}>${rateText}</span> <small style="opacity: 0.6;">(target: ${targetRate}/hr)</small>`;
             document.getElementById('sim-time-stat').textContent = formatTime(sim.simT);
             document.getElementById('real-time-stat').textContent = formatTime(sim.realT);
             document.getElementById('speed-stat').textContent = `${effectiveSpeed.toFixed(1)}x`;
@@ -2090,6 +2122,16 @@ out geom;
                 while (offlineOrderAccum >= 1.0) {
                     // Create order
                     const location = sampleOrder(hubLat, hubLng, testParams.avgRadiusKm);
+
+                    // Check if location is within max range
+                    const distKm = distanceKm(hubLat, hubLng, location.lat, location.lng);
+
+                    if (distKm > MAX_RANGE_KM) {
+                        // Order exceeds max range - skip it
+                        offlineOrderAccum -= 1.0;
+                        continue;
+                    }
+
                     const order = {
                         id: offlineOrderId++,
                         lat: location.lat,
@@ -2106,7 +2148,6 @@ out geom;
                     }
 
                     // Calculate timing
-                    const distKm = distanceKm(hubLat, hubLng, order.lat, order.lng);
                     const busySec = calculateBusyTime(distKm, testParams);
                     const tStart = Math.max(order.tCreated, minDrone.availableAt);
                     const waitSec = tStart - order.tCreated;
@@ -2424,6 +2465,20 @@ out geom;
                     // Sample random delivery location
                     const location = sampleOrder(hubLat, hubLng, params.avgRadiusKm);
 
+                    // Check if location is within max range
+                    const orderDist = distanceKm(hubLat, hubLng, location.lat, location.lng);
+
+                    if (orderDist > MAX_RANGE_KM) {
+                        // Order exceeds max range - skip it
+                        sim.ordersSkipped++;
+                        console.warn(`⚠️ Order beyond max range (${orderDist.toFixed(2)}km > ${MAX_RANGE_KM}km) - skipping (total skipped: ${sim.ordersSkipped})`);
+
+                        // Sample next arrival interval and continue
+                        const interval = samplePoissonInterval(params.ordersPerHour);
+                        sim.nextOrderTime += interval;
+                        continue;
+                    }
+
                     // Create order object
                     const order = {
                         id: sim.nextOrderId++,
@@ -2434,6 +2489,7 @@ out geom;
 
                     // Add to orders array
                     orders.push(order);
+                    sim.ordersCreated++;
 
                     // Log first 10 orders and then every 100th order
                     if (order.id < 10 || order.id % 100 === 0) {
@@ -2466,6 +2522,19 @@ out geom;
                     // Sample random delivery location
                     const location = sampleOrder(hubLat, hubLng, params.avgRadiusKm);
 
+                    // Check if location is within max range
+                    const orderDist = distanceKm(hubLat, hubLng, location.lat, location.lng);
+
+                    if (orderDist > MAX_RANGE_KM) {
+                        // Order exceeds max range - skip it
+                        sim.ordersSkipped++;
+                        console.warn(`⚠️ Order beyond max range (${orderDist.toFixed(2)}km > ${MAX_RANGE_KM}km) - skipping (total skipped: ${sim.ordersSkipped})`);
+
+                        // Decrement accumulator and continue
+                        sim.orderAccumulator -= 1.0;
+                        continue;
+                    }
+
                     // Create order object
                     const order = {
                         id: sim.nextOrderId++,
@@ -2476,6 +2545,7 @@ out geom;
 
                     // Add to orders array
                     orders.push(order);
+                    sim.ordersCreated++;
 
                     console.log(`📦 Order ${order.id} created at simT=${sim.simT.toFixed(1)}s (Deterministic), location=(${order.lat.toFixed(4)}, ${order.lng.toFixed(4)})`);
 

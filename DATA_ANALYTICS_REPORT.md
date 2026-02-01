@@ -6,7 +6,8 @@ This report presents a comprehensive data analytics framework for evaluating aut
 
 **Key Findings:**
 - Wait time distributions exhibit heavy-tailed behavior under high utilization (>80% fleet capacity)
-- Fleet size requirements scale linearly with demand up to ~60 orders/hr per drone, then exhibit diminishing returns
+- Fleet size requirements scale linearly with demand when system utilization is below 70% (each drone typically handles 3-6 deliveries/hour depending on distance and operational parameters)
+- Maximum delivery range of 8km enforces operational constraints on service area
 - Spatial delivery patterns show uniform distribution within service radius, enabling unbiased performance analysis
 - P95 wait time serves as a reliable SLA metric, converging after ~100-200 completed deliveries
 
@@ -676,11 +677,12 @@ For live operations, dashboard should track:
 
 ### 8.1 Current Model Limitations
 
-1. **No Battery Constraints:** Drones have infinite range (unrealistic for >20km radius)
+1. **Fixed 8km Range Constraint:** Hard limit on delivery distance (models Zipline operational capability, but no battery depletion modeling within this range)
 2. **Deterministic Service Times:** Real-world has variability (weather, handoff delays)
 3. **Single Hub:** Multi-depot routing is NP-hard (current model not applicable)
 4. **No Dynamic Routing:** Greedy assignment is locally optimal, not globally optimal
 5. **Unlimited Airspace:** No congestion or collision avoidance modeled
+6. **No Weather Effects:** Wind, rain, and visibility constraints not modeled
 
 ### 8.2 Recommended Extensions
 
@@ -711,12 +713,15 @@ serviceTime = lognormal(mu = 30, sigma = 10);
 
 **Benefit:** Captures real-world variability, provides confidence intervals on metrics.
 
-#### Battery Constraints & Charging Infrastructure
+#### Enhanced Battery Modeling & Charging Infrastructure
 
-Add state tracking:
+Current model has fixed 8km range constraint. Extension would add progressive battery depletion:
 ```javascript
 drone.batteryPct = 100;
-drone.batteryPct -= (distance × 2 / maxRange) × 100;
+drone.batteryPct -= (distance × 2 / MAX_RANGE_KM) × batteryConsumptionRate;
+
+// Dynamic range based on current battery level
+drone.currentMaxRange = (drone.batteryPct / 100) × MAX_RANGE_KM;
 
 if (drone.batteryPct < 20) {
     drone.needsCharge = true;
@@ -724,7 +729,7 @@ if (drone.batteryPct < 20) {
 }
 ```
 
-**Benefit:** Realistic fleet sizing for long-range operations.
+**Benefit:** Models battery degradation over multiple cycles, enables analysis of charging infrastructure requirements and battery swap logistics.
 
 ---
 

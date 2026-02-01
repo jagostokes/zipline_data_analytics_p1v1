@@ -682,6 +682,8 @@
         let buildingsCache = null;
         let lastBuildingsBbox = null;
         let buildingLocations = [];  // Array of [lat, lng] coordinates from buildings
+        let filteredBuildingLocations = [];  // Buildings within current delivery radius (for performance)
+        let lastFilteredRadius = 0;  // Track last radius used for filtering
 
         /**
          * Compute bounding box around a center point given a radius in km
@@ -797,6 +799,9 @@ out geom;
 
                 console.log(`Extracted ${buildingLocations.length} building locations for delivery sampling`);
 
+                // Filter buildings by current delivery radius for performance
+                filterBuildingsByRadius(params.avgRadiusKm);
+
                 // Clear existing buildings
                 buildingsLayer.clearLayers();
 
@@ -874,6 +879,9 @@ out geom;
                                 });
                             }
                             console.log(`Fallback: Extracted ${buildingLocations.length} building locations`);
+
+                            // Filter buildings by current delivery radius for performance
+                            filterBuildingsByRadius(params.avgRadiusKm);
 
                             buildingsLayer.clearLayers();
                             L.geoJSON(fallbackGeojson, {
@@ -1027,6 +1035,10 @@ out geom;
             }
 
             console.log(`✓ Total: ${totalBuildings} buildings, ${buildingLocations.length} delivery locations`);
+
+            // Filter buildings by current delivery radius for performance
+            filterBuildingsByRadius(params.avgRadiusKm);
+
             buildingsCache = { districts: true, count: buildingLocations.length };
         }
 
@@ -1307,6 +1319,27 @@ out geom;
         }
 
         /**
+         * Filter buildings to only those within delivery radius
+         * Call this when buildings are loaded or radius changes
+         * This dramatically improves performance at high order rates
+         */
+        function filterBuildingsByRadius(radiusKm) {
+            if (buildingLocations.length === 0) {
+                filteredBuildingLocations = [];
+                lastFilteredRadius = radiusKm;
+                return;
+            }
+
+            console.log(`Filtering ${buildingLocations.length} buildings for ${radiusKm}km radius...`);
+            filteredBuildingLocations = buildingLocations.filter(([lat, lng]) => {
+                const dist = distanceKm(hubLat, hubLng, lat, lng);
+                return dist <= radiusKm;
+            });
+            lastFilteredRadius = radiusKm;
+            console.log(`✓ ${filteredBuildingLocations.length} buildings within ${radiusKm}km radius`);
+        }
+
+        /**
          * Sample a random delivery location from actual building locations
          * Only returns buildings within the specified delivery radius
          * Falls back to uniform-in-disk if buildings not loaded
@@ -1317,34 +1350,21 @@ out geom;
          * @returns {object} Object with {lat, lng} in degrees
          */
         function sampleOrder(hubLat, hubLng, avgRadiusKm) {
-            // If we have building locations, sample from them
-            if (buildingLocations.length > 0) {
-                // Pre-filter buildings within delivery radius for better performance
-                // (Do this filtering on-demand rather than caching to handle dynamic radius changes)
-                const maxAttempts = 100;
-                let attempts = 0;
+            // Re-filter if radius changed (handles dynamic slider changes)
+            if (Math.abs(avgRadiusKm - lastFilteredRadius) > 0.01) {
+                filterBuildingsByRadius(avgRadiusKm);
+            }
 
-                while (attempts < maxAttempts) {
-                    // Random building from full set
-                    const randomIndex = Math.floor(Math.random() * buildingLocations.length);
-                    const [lat, lng] = buildingLocations[randomIndex];
+            // If we have filtered building locations, sample from them
+            if (filteredBuildingLocations.length > 0) {
+                const randomIndex = Math.floor(Math.random() * filteredBuildingLocations.length);
+                const [lat, lng] = filteredBuildingLocations[randomIndex];
+                return { lat, lng };
+            }
 
-                    // Check if within delivery radius
-                    const dist = distanceKm(hubLat, hubLng, lat, lng);
-
-                    // Strict radius check - only use buildings within specified radius
-                    if (dist <= avgRadiusKm) {
-                        return { lat, lng };
-                    }
-
-                    attempts++;
-                }
-
-                // If we've tried 100 times and can't find a building in radius,
-                // either the radius is too small or buildings don't cover the area
-                console.warn(`Could not find building within ${avgRadiusKm}km radius after ${maxAttempts} attempts. Total buildings: ${buildingLocations.length}. Consider increasing Buildings Radius or loading more districts.`);
-
-                // Fall through to uniform-in-disk as backup
+            // If no filtered buildings available, warn user
+            if (buildingLocations.length > 0 && filteredBuildingLocations.length === 0) {
+                console.warn(`No buildings within ${avgRadiusKm}km radius. Total buildings: ${buildingLocations.length}. Consider increasing Buildings Radius or Delivery Radius.`);
             }
 
             // Fallback: uniform-in-disk distribution (if buildings not loaded)
@@ -2373,6 +2393,10 @@ out geom;
             const sliderValue = parseFloat(timeScaleSlider.value);
             params.timeScale = isNaN(sliderValue) ? 1.0 : Math.min(Math.max(sliderValue, 0.1), MAX_TIME_SCALE);
 
+            // Read current ordersPerHour from slider in real-time (allows live adjustment)
+            const ordersSliderValue = parseInt(ordersPerHourSlider.value);
+            params.ordersPerHour = isNaN(ordersSliderValue) ? 60 : Math.min(ordersSliderValue, MAX_ORDERS_PER_HOUR);
+
             // Track both real time and simulation time
             sim.realT += dtReal;
             sim.simT += dtReal * params.timeScale;
@@ -2392,6 +2416,7 @@ out geom;
                 // Initialize next order time if not set
                 if (sim.nextOrderTime === 0) {
                     sim.nextOrderTime = samplePoissonInterval(params.ordersPerHour);
+                    console.log(`🔧 Initialized order generation: ${params.ordersPerHour} orders/hr, first order at t=${sim.nextOrderTime.toFixed(2)}s`);
                 }
 
                 // Check if it's time for next order
@@ -2410,11 +2435,11 @@ out geom;
                     // Add to orders array
                     orders.push(order);
 
-                    // Log first 10 orders and then every 50th order
-                    if (order.id < 10 || order.id % 50 === 0) {
+                    // Log first 10 orders and then every 100th order
+                    if (order.id < 10 || order.id % 100 === 0) {
                         const expectedRate = params.ordersPerHour;
                         const actualRate = orders.length / (sim.simT / 3600);
-                        console.log(`📦 Order ${order.id} created at simT=${sim.nextOrderTime.toFixed(1)}s | Expected: ${expectedRate}/hr | Actual: ${actualRate.toFixed(1)}/hr`);
+                        console.log(`📦 Order ${order.id} at t=${sim.nextOrderTime.toFixed(1)}s | Expected: ${expectedRate}/hr | Actual: ${actualRate.toFixed(1)}/hr | timeScale: ${params.timeScale}x`);
                     }
 
                     // Schedule order to drone
